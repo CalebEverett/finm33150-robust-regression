@@ -1,16 +1,27 @@
 import gzip
+import hashlib
 import os
 from typing import Dict, List
+from urllib.request import urlretrieve
 
+import boto3
+from botocore import UNSIGNED
+from botocore.client import Config
+from canvasapi import Canvas
+import numpy as np
 import numpy as np
 import pandas as pd
-import plotly.express as px
+from patsy import dmatrices
 import plotly.graph_objects as go
-import quandl
-from canvasapi import Canvas
+import plotly.express as px
 from plotly import colors
 from plotly.subplots import make_subplots
+import quandl
+import requests
 from scipy import stats
+import statsmodels as sm
+from tqdm.notebook import tqdm
+
 
 # =============================================================================
 # Credentials
@@ -65,6 +76,163 @@ def get_trade_data(pair: str, year: str, path: str = "accumulation_opportunity/d
     df.timestamp_utc_nanoseconds = pd.to_datetime(df.timestamp_utc_nanoseconds)
 
     return df.set_index("timestamp_utc_nanoseconds")
+
+
+# =============================================================================
+# Price Data
+# =============================================================================
+
+
+def get_table(dataset_code: str, database_code: str = "ZACKS"):
+    """Downloads Zacks fundamental table from export api to local zip file."""
+
+    url = (
+        f"https://www.quandl.com/api/v3/datatables/{database_code}/{dataset_code}.json"
+    )
+    r = requests.get(
+        url, params={"api_key": os.getenv("QUANDL_API_KEY"), "qopts.export": "true"}
+    )
+    data = r.json()
+    urlretrieve(
+        data["datatable_bulk_download"]["file"]["link"],
+        f"zacks_{dataset_code.lower()}.zip",
+    )
+
+
+def load_table_files(table_filenames: Dict):
+    """Loads Zacks fundamentals tables from csv files."""
+
+    dfs = []
+    for v in tqdm(table_filenames.values()):
+        dfs.append(pd.read_csv(v, low_memory=False))
+
+    return dfs
+
+
+def get_hash(string: str) -> str:
+    """Returns md5 hash of string."""
+
+    return hashlib.md5(str(string).encode()).hexdigest()
+
+
+def fetch_ticker(
+    dataset_code: str, query_params: Dict = None, database_code: str = "EOD"
+):
+    """Fetches price data for a single ticker."""
+
+    url = f"https://www.quandl.com/api/v3/datasets/{database_code}/{dataset_code}.json"
+
+    params = dict(api_key=os.getenv("QUANDL_API_KEY"))
+    if query_params is not None:
+        params = dict(**params, **query_params)
+
+    r = requests.get(url, params=params)
+
+    dataset = r.json()["dataset"]
+    df = pd.DataFrame(
+        dataset["data"], columns=[c.lower() for c in dataset["column_names"]]
+    )
+    df["ticker"] = dataset["dataset_code"]
+
+    return df.sort_values("date")
+
+
+def fetch_all_tickers(tickers: List, query_params: Dict) -> pd.DataFrame:
+    """Fetches price data from Quandl for each ticker in provide list and
+    returns a dataframe of them concatenated together.
+    """
+
+    df_prices = pd.DataFrame()
+    for t in tqdm(tickers):
+        try:
+            df = fetch_ticker(t, query_params)
+            df_prices = pd.concat([df_prices, df])
+        except:
+            print(f"Couldn't get prices for {t}.")
+
+    not_missing_data = (
+        df_prices.set_index(["ticker", "date"])[["adj_close"]]
+        .unstack("date")
+        .isna()
+        .sum(axis=1)
+        == 0
+    )
+
+    df_prices = df_prices[
+        df_prices.ticker.isin(not_missing_data[not_missing_data].index)
+    ]
+
+    return df_prices.set_index(["ticker", "date"])
+
+
+# =============================================================================
+# Download Preprocessed Files from S3
+# =============================================================================
+
+
+def upload_s3_file(filename: str):
+    """Uploads file to S3. Requires credentials with write permissions to exist
+    as environment variables.
+    """
+
+    client = boto3.client("s3")
+    client.upload_file(filename, "finm33150", filename)
+
+
+def download_s3_file(filename: str):
+    """Downloads file from read only S3 bucket."""
+
+    client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    client.download_file("finm33150", filename, filename)
+
+
+# =============================================================================
+# Regression
+# =============================================================================
+
+
+def get_errors(
+    df_data: pd.DataFrame,
+    model: str = "OLS",
+    penalty: str = "Huber",
+    weeks_in: int = 16,
+    weeks_out: int = 4,
+    B0: int = 1,
+):
+
+    errors_list = []
+    for day in df_data.index.levels[0][: -(weeks_in + weeks_out - 1)]:
+        df_in = df_data.loc[day : day + pd.DateOffset(weeks=weeks_in - 1)]
+        df_out = df_data.loc[
+            day
+            + pd.DateOffset(weeks=weeks_in) : day
+            + pd.DateOffset(weeks=weeks_in + weeks_out - 1)
+        ]
+
+        y_in, X_in = dmatrices(
+            f"r_spread ~ r_index + r_equity + {B0}", data=df_in, return_type="dataframe"
+        )
+
+        if model == "OLS":
+            res = sm.api.OLS(y_in, X_in).fit()
+        else:
+            if penalty == "Huber":
+                res = sm.api.RLM(y_in, X_in, M=sm.api.robust.norms.HuberT()).fit()
+            else:
+                res = sm.api.RLM(
+                    y_in, X_in, M=sm.api.robust.norms.TukeyBiweight()
+                ).fit()
+
+        y_out, X_out = dmatrices(
+            f"r_spread ~ r_index + r_equity + {B0}",
+            data=df_out,
+            return_type="dataframe",
+        )
+        df_e = (res.predict(X_out) - y_out.r_spread).to_frame(name="error")
+        df_e["distance"] = df_e.groupby(["date"]).ngroup() + 1
+        errors_list.append(df_e)
+
+    return pd.concat(errors_list), res.summary()
 
 
 # =============================================================================
@@ -219,24 +387,15 @@ def get_results_df(df: pd.DataFrame, params: Dict, nobs: int = 100) -> pd.DataFr
 # Charts
 # =============================================================================
 
-COLORS = colors.qualitative.D3
+COLORS = colors.qualitative.T10
 
 IS_labels = [
-    ("obs", lambda x: f"{x:>16d}"),
-    ("min:max", lambda x: f"{x[0]:>0.3f}:{x[1]:>0.3f}"),
-    ("mean", lambda x: f"{x:>13.4f}"),
-    ("std", lambda x: f"{x:>15.4f}"),
-    ("skewness", lambda x: f"{x:>11.4f}"),
-    ("kurtosis", lambda x: f"{x:>13.4f}"),
-]
-
-ET_labels = [
-    ("obs", lambda x: f"{x:>16d}"),
-    ("min:max", lambda x: f"{x[0]:>0.0f}:{x[1]:>0.0f}"),
-    ("mean", lambda x: f"{x:>13.2f}"),
-    ("std", lambda x: f"{x:>15.2f}"),
-    ("skewness", lambda x: f"{x:>11.4f}"),
-    ("kurtosis", lambda x: f"{x:>13.4f}"),
+    ("obs", lambda x: f"{x:>7d}"),
+    ("min:max", lambda x: f"{x[0]:>0.4f}:{x[1]:>0.3f}"),
+    ("mean", lambda x: f"{x:>7.4f}"),
+    ("std", lambda x: f"{x:>7.4f}"),
+    ("skewness", lambda x: f"{x:>7.4f}"),
+    ("kurtosis", lambda x: f"{x:>7.4f}"),
 ]
 
 
@@ -256,11 +415,13 @@ def get_moments_annotation(
     moments = list(stats.describe(s.to_numpy()))
     moments[3] = np.sqrt(moments[3])
 
+    sharpe = s.mean() / s.std()
+
     return go.layout.Annotation(
         text=(
-            f"{title}:<br>"
+            f"<b>sharpe: {sharpe:>8.4f}</b><br>"
             + ("<br>").join(
-                [f"{k[0]:<10}{k[1](moments[i])}" for i, k in enumerate(labels)]
+                [f"{k[0]:<9}{k[1](moments[i])}" for i, k in enumerate(labels)]
             )
         ),
         align="left",
@@ -270,243 +431,314 @@ def get_moments_annotation(
         x=x,
         y=y,
         bordercolor="black",
-        borderwidth=1,
+        borderwidth=0.5,
         borderpad=2,
         bgcolor="white",
-        font=dict(size=10),
         xanchor=xanchor,
         yanchor="top",
     )
 
 
-def make_trade_prices_chart(
-    df: pd.DataFrame,
-    df_accum: pd.DataFrame,
-    df_trades: pd.DataFrame,
-) -> go.Figure:
-    df_result = df[df_accum.index.min() : df_accum.index.max()]
-
-    fig = go.Figure()
-
-    fig.add_scatter(
-        x=df_result[df_result.Side == 1].index,
-        y=df_result[df_result.Side == 1].PriceMillionths,
-        mode="markers",
-        name="Buy",
-        marker=dict(size=7, color=COLORS[0]),
-    )
-    fig.add_scatter(
-        x=df_result[df_result.Side == -1].index,
-        y=df_result[df_result.Side == -1].PriceMillionths,
-        mode="markers",
-        name="Sell",
-        marker=dict(size=7, color=COLORS[4]),
-    )
-    fig.add_scatter(
-        x=df_trades.index,
-        y=df_trades.StratTradePrice,
-        mode="markers",
-        name="Trade",
-        marker=dict(size=4, color=COLORS[1]),
-    )
-    fig.update_layout(
-        title=(
-            f"Trade Prices: {df.name}<br>{str(df_accum.index.min())[:19]} "
-            f"- {str(df_accum.index.max())[:19]}"
-        ),
-        xaxis_title="timestamp_utc_nanoseconds",
-        yaxis_title="PriceMillionths",
-    )
-
-    return fig
-
-
-def make_trade_sizes_chart(
-    df: pd.DataFrame,
-    df_accum: pd.DataFrame,
-    df_trades: pd.DataFrame,
-    bar_width: int = 3000,
-) -> go.Figure:
-    df_result = df[df_accum.index.min() : df_accum.index.max()]
-
-    fig = go.Figure()
-
-    fig.add_bar(
-        x=df_result[df_result.Side == 1].index,
-        y=df_result[df_result.Side == 1].SizeBillionths,
-        name="Buy",
-        marker_color=COLORS[0],
-        width=bar_width,
-    )
-    fig.add_bar(
-        x=df_result[df_result.Side == -1].index,
-        y=df_result[df_result.Side == -1].SizeBillionths * -1,
-        name="Sell",
-        marker_color=COLORS[4],
-        width=bar_width,
-    )
-    fig.add_bar(
-        x=df_trades.index,
-        y=df_trades.StratTradeSize * df_accum.iloc[0].Side,
-        name="Trade",
-        marker_color=COLORS[1],
-        width=bar_width,
-    )
-    fig.update_layout(
-        title=(
-            f"Trade Sizes: {df.name}<br>{str(df_accum.index.min())[:19]} "
-            f"- {str(df_accum.index.max())[:19]}"
-        ),
-        xaxis_title="timestamp_utc_nanoseconds",
-        yaxis_title="SizeBillionths",
-    )
-
-    return fig
-
-
-def make_participation_chart(
-    df_accum: pd.DataFrame, df_trades: pd.DataFrame, name: str = "BTC-USD"
-) -> go.Figure:
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_accum.index,
-            y=df_accum.CumSizeBillionths,
-            name="Cumulative Total Volume",
-            line=dict(color=COLORS[2]),
-        ),
-        secondary_y=True,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_accum.index,
-            y=df_accum.CumParticipation,
-            name="Target Participation",
-            line=dict(color=COLORS[3]),
-        ),
-        secondary_y=False,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_trades.index,
-            y=df_trades.StratTradeSize.cumsum(),
-            name="Actual Participation",
-            line=dict(color=COLORS[1]),
-        ),
-        secondary_y=False,
-    )
-
-    fig.update_layout(
-        title=(
-            f"Target vs. Actual Participation: {name}"
-            f"<br>{str(df_accum.index.min())[:19]} - {str(df_accum.index.max())[:19]}"
-        ),
-        xaxis_title="timestamp_utc_nanoseconds",
-        yaxis_title="SizeBillionths - Target and Actual",
-        yaxis2_title="SizeBillionths - Total",
-    )
-
-    return fig
-
-
-def get_result_hist(
-    df_results: pd.DataFrame, title_text: str = "IS and Time Distributions"
+def make_components_chart(
+    yc_L: str,
+    fx_B: str,
+    fx_L: str,
+    libor: str,
+    leverage: float,
+    date_range: pd.date_range,
+    dfs_yc: Dict,
+    dfs_fx: Dict,
+    dfs_libor: Dict,
 ) -> go.Figure:
 
     fig = make_subplots(
-        rows=1,
+        rows=2,
         cols=2,
-        subplot_titles=["Implementation Shortfall", "Execution Duration"],
+        subplot_titles=[
+            f"5-Year Yield: {yc_L}",
+            f"FX Rate: {fx_L}:{fx_B}",
+            f"3 Month Libor: {libor}",
+            f"FX Rate: {fx_B}:USD",
+        ],
+        vertical_spacing=0.09,
+        horizontal_spacing=0.08,
+        specs=[
+            [{"secondary_y": True}, {"secondary_y": True}],
+            [{"secondary_y": False}, {"secondary_y": True}],
+        ],
+    )
+
+    # Lend market yield
+    # =================
+    fig.add_trace(
+        go.Scatter(
+            x=date_range,
+            y=dfs_yc[yc_L].loc[date_range]["5-year"],
+            line=dict(width=1, color=COLORS[0]),
+            name=yc_L,
+        ),
+        row=1,
+        col=1,
+        secondary_y=False,
     )
 
     fig.add_trace(
-        go.Histogram(x=df_results.IS, name="IS", histnorm="percent"), row=1, col=1
+        go.Scatter(
+            x=date_range,
+            y=dfs_yc[yc_L].loc[date_range]["5-year"].pct_change() * 100,
+            line=dict(width=1, color=COLORS[1], dash="dot"),
+            name=yc_L,
+        ),
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
+
+    # Borrow market fx
+    # =================
+    fig.add_trace(
+        go.Scatter(
+            x=date_range,
+            y=dfs_fx[fx_B].loc[date_range].rate,
+            line=dict(width=1, color=COLORS[0]),
+            name=fx_B,
+        ),
+        row=2,
+        col=2,
+        secondary_y=False,
     )
 
     fig.add_trace(
-        go.Histogram(
-            x=df_results.execution_time.dt.seconds.divide(60),
-            name="execution_time",
-            histnorm="percent",
+        go.Scatter(
+            x=date_range,
+            y=dfs_fx[fx_B].loc[date_range].rate.pct_change() * 100,
+            line=dict(width=1, color=COLORS[1], dash="dot"),
+            name=fx_B,
+        ),
+        row=2,
+        col=2,
+        secondary_y=True,
+    )
+
+    # Borrow market funding cost
+    # =================
+    fig.add_trace(
+        go.Scatter(
+            x=date_range,
+            y=dfs_libor[libor].loc[date_range].value,
+            line=dict(width=1, color=COLORS[0]),
+            name=libor,
+        ),
+        row=2,
+        col=1,
+    )
+
+    # Lend market fx cost
+    # =================
+    fx_BL = (
+        dfs_fx[fx_L].loc[date_range].loc[date_range].rate
+        / dfs_fx[fx_B].loc[date_range].rate
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=date_range,
+            y=fx_BL,
+            line=dict(width=1, color=COLORS[0]),
+            name=fx_L,
+        ),
+        row=1,
+        col=2,
+        secondary_y=False,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=date_range,
+            y=fx_BL.pct_change() * 100,
+            line=dict(width=1, color=COLORS[1], dash="dot"),
+            name=fx_L,
+        ),
+        row=1,
+        col=2,
+        secondary_y=True,
+    )
+
+    fig.update_xaxes(showline=True, linewidth=1, linecolor="grey", mirror=True)
+    fig.update_yaxes(
+        showline=True, linewidth=1, linecolor="grey", mirror=True, tickformat="0.1f"
+    )
+
+    fig.update_layout(
+        title_text=(
+            f"Weekly Carry Trade: Borrow {fx_B}, Lend {yc_L}"
+            "<br>Underlying Securities: "
+            f"{date_range.min().strftime('%Y-%m-%d')}"
+            f" - {date_range.max().strftime('%Y-%m-%d')}"
+        ),
+        showlegend=False,
+        height=600,
+        font=dict(size=10),
+        margin=dict(l=50, r=10, b=40, t=90),
+        yaxis3=dict(tickformat="0.3f"),
+    )
+
+    for i in fig["layout"]["annotations"]:
+        i["font"]["size"] = 12
+
+    return fig
+
+
+def make_returns_chart(df_ret: pd.DataFrame) -> go.Figure:
+
+    fx_B, yc_L = df_ret.name.split(",")
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=[
+            f"Weekly Returns",
+            f"Returns Distribution",
+            f"Cumulative Returns",
+            f"Q/Q Plot",
+        ],
+        vertical_spacing=0.09,
+        horizontal_spacing=0.08,
+    )
+
+    # Returns Distribution
+    returns = pd.cut(df_ret.per_return, 50).value_counts().sort_index()
+    midpoints = returns.index.map(lambda interval: interval.right).to_numpy()
+    norm_dist = stats.norm.pdf(
+        midpoints, loc=df_ret.per_return.mean(), scale=df_ret.per_return.std()
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_ret.index,
+            y=df_ret.per_return * 100,
+            line=dict(width=1, color=COLORS[0]),
+            name="return",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_ret.index,
+            y=df_ret.per_return.cumsum() * 100,
+            line=dict(width=1, color=COLORS[0]),
+            name="cum. return",
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=[interval.mid for interval in returns.index],
+            y=returns / returns.sum() * 100,
+            name="pct. of returns",
+            marker=dict(color=COLORS[0]),
         ),
         row=1,
         col=2,
     )
 
-    IS_mean_line = dict(
-        type="line",
-        yref="paper",
-        y0=0.02,
-        y1=0.98,
-        xref="x",
-        line_dash="dot",
-        line_width=3,
-        x0=df_results.IS.mean(),
-        x1=df_results.IS.mean(),
-        line=dict(color=COLORS[3]),
+    fig.add_trace(
+        go.Scatter(
+            x=[interval.mid for interval in returns.index],
+            y=norm_dist / norm_dist.sum() * 100,
+            name="normal",
+            line=dict(width=1, color=COLORS[1]),
+        ),
+        row=1,
+        col=2,
     )
 
-    ET_mean_line = dict(
-        type="line",
-        yref="paper",
-        y0=0.02,
-        y1=0.98,
-        xref="x2",
-        line_dash="dot",
-        line_width=3,
-        x0=df_results.execution_time.dt.seconds.divide(60).mean(),
-        x1=df_results.execution_time.dt.seconds.divide(60).mean(),
-        line=dict(color=COLORS[3]),
+    # Q/Q Data
+    returns_norm = (
+        (df_ret.per_return - df_ret.per_return.mean()) / df_ret.per_return.std()
+    ).sort_values()
+    norm_dist = pd.Series(
+        list(map(stats.norm.ppf, np.linspace(0.001, 0.999, len(df_ret.per_return)))),
+        name="normal",
     )
 
-    fig.update_layout(shapes=[IS_mean_line, ET_mean_line], title_text=title_text)
+    fig.append_trace(
+        go.Scatter(
+            x=norm_dist,
+            y=returns_norm,
+            name="return norm.",
+            mode="markers",
+            marker=dict(color=COLORS[0], size=3),
+        ),
+        row=2,
+        col=2,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=norm_dist,
+            y=norm_dist,
+            name="norm.",
+            line=dict(width=1, color=COLORS[1]),
+        ),
+        row=2,
+        col=2,
+    )
+
+    fig.add_annotation(
+        text=(f"{df_ret.per_return.cumsum()[-1] * 100:0.2f}"),
+        xref="paper",
+        yref="y3",
+        x=0.465,
+        y=df_ret.per_return.cumsum()[-1] * 100,
+        xanchor="left",
+        showarrow=False,
+        align="left",
+    )
 
     fig.add_annotation(
         get_moments_annotation(
-            df_results.IS, "paper", "paper", 0.4, 0.98, "right", "IS", IS_labels
-        )
+            df_ret.per_return,
+            xref="paper",
+            yref="paper",
+            x=0.81,
+            y=0.23,
+            xanchor="left",
+            title="Returns",
+            labels=IS_labels,
+        ),
+        font=dict(size=6, family="Courier New, monospace"),
     )
 
-    fig.add_annotation(
-        get_moments_annotation(
-            df_results.execution_time.dt.seconds.divide(60),
-            "paper",
-            "paper",
-            0.98,
-            0.98,
-            "right",
-            "Time",
-            ET_labels,
-        )
+    fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+    fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+
+    fig.update_layout(
+        title_text=(
+            f"Weekly Carry Trade: Borrow {fx_B}, Lend {yc_L}"
+            "<br>Returns: "
+            f"{df_ret.index.min().strftime('%Y-%m-%d')}"
+            f" - {df_ret.index.max().strftime('%Y-%m-%d')}"
+        ),
+        showlegend=False,
+        height=600,
+        font=dict(size=10),
+        margin=dict(l=50, r=50, b=50, t=100),
+        yaxis=dict(tickformat="0.1f"),
+        yaxis3=dict(tickformat="0.1f"),
+        yaxis2=dict(tickformat="0.1f"),
+        yaxis4=dict(tickformat="0.1f"),
+        xaxis2=dict(tickformat="0.1f"),
+        xaxis4=dict(tickformat="0.1f"),
     )
 
-    return fig
+    for i in fig["layout"]["annotations"]:
+        i["font"]["size"] = 12
 
-
-def make_shortfall_time_scatter(
-    df_results: pd.DataFrame, n_trend_obs: int = 200
-) -> go.Figure:
-
-    ols_result = stats.linregress(
-        df_results.execution_time.dt.seconds.divide(60), df_results.IS
-    )
-    print(ols_result)
-
-    fig = px.scatter(
-        y=df_results.IS,
-        x=df_results.execution_time.dt.seconds.divide(60),
-        title="Implementation Shortfall vs. Execution Duration",
-        labels=dict(y="IS", x="execution_time"),
-    )
-
-    fig.add_scatter(
-        x=np.arange(n_trend_obs),
-        y=[ols_result.intercept + ols_result.slope * x for x in np.arange(n_trend_obs)],
-    )
-
-    fig.update_layout(showlegend=False)
+    fig.update_annotations(font=dict(size=10))
 
     return fig
