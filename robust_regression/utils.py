@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 import quandl
 import requests
 from scipy import stats
-import statsmodels as sm
+import statsmodels.api as sm
 from tqdm.notebook import tqdm
 
 
@@ -214,25 +214,105 @@ def get_errors(
         )
 
         if model == "OLS":
-            res = sm.api.OLS(y_in, X_in).fit()
+            res = sm.OLS(y_in, X_in).fit()
         else:
-            if penalty == "Huber":
-                res = sm.api.RLM(y_in, X_in, M=sm.api.robust.norms.HuberT()).fit()
+            if penalty == "Tukey":
+                res = sm.RLM(y_in, X_in, M=sm.robust.norms.TukeyBiweight()).fit()
             else:
-                res = sm.api.RLM(
-                    y_in, X_in, M=sm.api.robust.norms.TukeyBiweight()
-                ).fit()
+                res = sm.RLM(y_in, X_in).fit()
 
         y_out, X_out = dmatrices(
             f"r_spread ~ r_index + r_equity + {B0}",
             data=df_out,
             return_type="dataframe",
         )
-        df_e = (res.predict(X_out) - y_out.r_spread).to_frame(name="error")
+        df_e = (res.predict(X_out) - y_out.r_spread).to_frame(name="resid")
+        df_e["scale"] = res.scale
+        df_e["sresid"] = df_e.resid / df_e.scale
+        df_e["model_date"] = df_in.index.min()
+
         df_e["distance"] = df_e.groupby(["date"]).ngroup() + 1
         errors_list.append(df_e)
 
     return pd.concat(errors_list), res.summary()
+
+
+def get_cum_errors(df_errors: pd.DataFrame, quantiles: int = 100) -> pd.DataFrame:
+    """
+    Returns dataframe with cumulative mean error by quantile.
+    """
+
+    df_e_agg = (
+        df_errors.resid.abs()
+        .groupby(pd.qcut(df_errors.resid.abs(), 100).cat.codes)
+        .agg(["sum", "count"])
+    )
+    df_e_agg["cummean"] = df_e_agg["sum"].cumsum() / df_e_agg["count"].cumsum()
+
+    return df_e_agg
+
+
+# =============================================================================
+# Charts
+# =============================================================================
+
+
+def make_cum_error_chart(errors: Dict):
+
+    fig = go.Figure()
+
+    for model, df in errors.items():
+        df_cum = get_cum_errors(df)
+        fig.add_trace(
+            go.Scatter(
+                x=df_cum.index,
+                y=df_cum.cummean,
+                line=dict(width=2),
+                name=model,
+            ),
+        )
+
+    fig.update_layout(
+        title_text=("Cumulative Mean Error by Quantile"),
+        showlegend=True,
+        font=dict(size=10),
+        margin=dict(l=50, r=10, b=40, t=90),
+        xaxis_title="error quantile",
+        yaxis_title="error",
+        hovermode="x",
+    )
+
+    return fig
+
+
+def make_efficiency_chart(errors: Dict):
+
+    efficiency = (
+        get_cum_errors(list(errors.values())[0]).cummean
+        / get_cum_errors(list(errors.values())[1]).cummean
+    )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=efficiency.index,
+            y=efficiency.values,
+            line=dict(width=2),
+            name=(":").join(errors.keys()),
+        ),
+    )
+
+    fig.update_layout(
+        title_text=("Relative Efficiency by Error Quantile"),
+        showlegend=True,
+        font=dict(size=10),
+        margin=dict(l=50, r=10, b=40, t=90),
+        xaxis_title="error quantile",
+        yaxis_title="efficiency",
+    )
+
+    return fig
 
 
 # =============================================================================

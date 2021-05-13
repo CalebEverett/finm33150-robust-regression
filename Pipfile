@@ -26,6 +26,9 @@ ipywidgets = "*"
 boto3 = "*"
 statsmodels = "*"
 patsy = "*"
+matplotlib = "*"
+seaborn = "*"
+scikit-learn = "*"
 
 [requires]
 python_version = "3.8"
