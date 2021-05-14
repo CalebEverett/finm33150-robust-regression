@@ -1,5 +1,5 @@
 [![build status](https://github.com/CalebEverett/finm33150-robust-regression/actions/workflows/build.yml/badge.svg)](https://github.com/CalebEverett/finm33150-robust-regression/actions/workflows/build.yml)
-[![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.jupyter.org/github/CalebEverett/finm33150-robust-regression/blob/master/robust_regression.ipynb?flush_cache=True)
+[![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.jupyter.org/github/CalebEverett/finm33150-robust-regression/blob/master/robust_regression.ipynb)
 
 # FINM33150 - Robust Regression
 
